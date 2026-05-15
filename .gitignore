@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.log
+
+.idea/
+.vscode/
+
+Exp_Only_*/
+Exp_Power_Fusion/
+save/
+
+*.pth
+*.png
+*.csv
+*.xlsx
+*.npy
