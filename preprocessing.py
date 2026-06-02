@@ -1,6 +1,8 @@
 import os
 import re
 import numpy as np
+import argparse
+import copy
 from tqdm import tqdm
 from base.eeg import GenericEegController
 from base.utils import ensure_dir
@@ -12,6 +14,8 @@ class MASA_Express_Preprocessor:
 
     def run(self):
         root_dir = os.path.join(self.config['root_directory'], self.config['raw_data_folder'])
+        features_to_extract = self.config.get('eeg_config', {}).get('features', [])
+        print(f"Extracting features = {features_to_extract}")
 
         # 递归扫描所有以 SIEEG 开头并以 .csv 结尾的文件
         all_files = []
@@ -58,6 +62,15 @@ class MASA_Express_Preprocessor:
 if __name__ == "__main__":
     from configs import config
 
-    # 只需要这两行，直接起飞！
-    preprocessor = MASA_Express_Preprocessor(config)
+    parser = argparse.ArgumentParser(description="MASA feature extraction")
+    parser.add_argument("--extract_features", action="store_true")
+    parser.add_argument("--features", default=None, type=str)
+    args = parser.parse_args()
+
+    run_config = copy.deepcopy(config)
+    if args.extract_features and args.features is not None:
+        features = [item.strip() for item in args.features.split(",") if item.strip()]
+        run_config['eeg_config']['features'] = features
+
+    preprocessor = MASA_Express_Preprocessor(run_config)
     preprocessor.run()

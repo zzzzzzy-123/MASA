@@ -188,14 +188,53 @@ class TemporalConvNetProM(nn.Module):
 
 # ==== 终极灵活版 MASA_TCN_Regressor ====
 
+class ChannelSEBlock(nn.Module):
+    def __init__(self, num_channels, reduction=4):
+        super(ChannelSEBlock, self).__init__()
+        hidden_dim = max(1, num_channels // reduction)
+        self.mlp = nn.Sequential(
+            nn.Linear(num_channels, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        batch_size, num_channels, freq, seq_len = x.shape
+        pooled = x.mean(dim=(2, 3))
+        weights = self.mlp(pooled).view(batch_size, num_channels, 1, 1)
+        return x * weights, weights.squeeze(-1).squeeze(-1)
+
+
 class MASA_TCN_Regressor(nn.Module):
     # 修正版：完美适配通道与频段的乘积，加入不确定性混合输出头！
-    def __init__(self, num_channels_list, num_eeg_chan=8, freq=5, kernel_sizes=[2, 4, 6], dropout=0.3, max_si_score=30):
+    def __init__(
+        self,
+        num_channels_list,
+        num_eeg_chan=8,
+        freq=5,
+        kernel_sizes=[2, 4, 6],
+        dropout=0.3,
+        max_si_score=30,
+        use_channel_attention=True,
+        input_channels=1,
+    ):
         #护法修复：在参数列表末尾加上了 max_si_score=30
         super(MASA_TCN_Regressor, self).__init__()
 
         # 1. 自动计算总输入特征数 (8通道 * 每通道频段)
-        total_in_features = num_eeg_chan * freq
+        self.input_channels = int(input_channels)
+        total_in_features = self.input_channels * num_eeg_chan * freq
+
+        self.num_eeg_chan = num_eeg_chan
+        self.freq = freq
+        self.use_channel_attention = use_channel_attention
+        self.channel_attention = (
+            ChannelSEBlock(num_eeg_chan)
+            if use_channel_attention
+            else None
+        )
+        self.latest_channel_weights = None
 
         self.feature_gate = nn.Parameter(torch.ones(total_in_features, 1))
         #设定压缩后的目标频段数 (每个通道只保留 2 个高密度特征)
@@ -255,22 +294,30 @@ class MASA_TCN_Regressor(nn.Module):
             nn.Linear(final_out_channels // 2, 1)
         )
 
-        self.risk_head = nn.Sequential(
-            nn.Linear(final_out_channels, final_out_channels // 2),
-            nn.PReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(final_out_channels // 2, 2)
-        )
-
-        # 提前准备好 0~30 的分数刻度尺 (存在显存中，不参与梯度更新)
         self.register_buffer('score_scale', torch.arange(0, self.num_classes).float())
         # 伯努利惩罚系数 λ (强迫模型必须有明确的态度，不许模棱两可)
         self.lambda_penalty = 0.1
 
-    def forward(self, x):
+    def extract_sequence_features(self, x):
         # 假设 x 形状: [Batch, 1, 40或96, Seq_len] -> [Batch, 40或96, Seq_len]
         if x.dim() == 4:
-            x = x.squeeze(1)
+            if x.shape[1] == 1:
+                x = x.squeeze(1)
+            else:
+                batch_size, input_channels, feature_dim, seq_len = x.shape
+                x = x.reshape(batch_size, input_channels * feature_dim, seq_len)
+
+        if self.channel_attention is not None:
+            batch_size, feature_dim, seq_len = x.shape
+            expected_dim = self.input_channels * self.num_eeg_chan * self.freq
+            if feature_dim != expected_dim:
+                raise ValueError(
+                    f"Channel attention expected {expected_dim} features, got {feature_dim}"
+                )
+            channel_view = x.view(batch_size, self.num_eeg_chan, self.input_channels * self.freq, seq_len)
+            channel_view, channel_weights = self.channel_attention(channel_view)
+            self.latest_channel_weights = channel_weights.detach()
+            x = channel_view.view(batch_size, feature_dim, seq_len)
 
         #启动机关零：特征门控
         gate = torch.sigmoid(self.feature_gate)
@@ -291,7 +338,14 @@ class MASA_TCN_Regressor(nn.Module):
         #机关三：全局平均池化 (GAP)
         # ==============================================================
         tcn_features = tcn_out[:, :, 0, :]  # [Batch, Hidden, Seq_len]
-        global_features = torch.mean(tcn_features, dim=-1)  # 拍扁成: [Batch, Hidden]
+        return tcn_features.transpose(1, 2)  # [Batch, Seq_len, Hidden]
+
+    def extract_backbone_embedding(self, x):
+        h_seq = self.extract_sequence_features(x)
+        global_features = torch.mean(h_seq, dim=1)  # [Batch, Hidden]
+        return global_features
+
+    def apply_output_heads(self, global_features):
 
         # ==============================================================
         #计算混合输出：Logits + 连续期望分数
@@ -301,7 +355,11 @@ class MASA_TCN_Regressor(nn.Module):
 
         # 2. Direct regression score. The trainer optimizes this continuous output.
         direct_score = self.score_regressor(global_features)
-        risk_logits = self.risk_head(global_features)
 
         # 必须同时返回 logits 和 expected_score 喂给 trainer!
-        return direct_score, logits, risk_logits
+        return direct_score, logits
+
+    def forward(self, x):
+        global_features = self.extract_backbone_embedding(x)
+
+        return self.apply_output_heads(global_features)

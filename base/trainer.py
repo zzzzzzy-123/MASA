@@ -14,7 +14,7 @@ from base.scheduler import GradualWarmupScheduler
 from base.utils import ensure_dir
 
 
-def pairwise_rank_loss(pred, label, margin=1.0, min_label_gap=0.4):
+def pairwise_rank_loss(pred, label, margin=1.0, min_label_gap=0.4, return_count=False):
     pred = pred.view(-1)
     label = label.view(-1)
 
@@ -24,11 +24,14 @@ def pairwise_rank_loss(pred, label, margin=1.0, min_label_gap=0.4):
     sign = torch.sign(label_diff)
     valid = torch.abs(label_diff) >= min_label_gap
 
-    if valid.sum() == 0:
-        return torch.tensor(0.0, device=pred.device)
+    valid_count = valid.sum()
+    if valid_count == 0:
+        zero_loss = torch.tensor(0.0, device=pred.device)
+        return (zero_loss, 0) if return_count else zero_loss
 
     loss = torch.relu(margin - sign * pred_diff)
-    return loss[valid].mean()
+    loss_value = loss[valid].mean()
+    return (loss_value, int(valid_count.detach().cpu().item())) if return_count else loss_value
 
 
 class Trainer(object):
@@ -42,18 +45,20 @@ class Trainer(object):
         self.min_epoch = kwargs['min_epoch']
         self.max_epoch = kwargs['max_epoch']
         self.start_epoch = 0
-        self.early_stopping = 20
+        self.early_stopping = int(kwargs.get('early_stopping', 20))
         self.early_stopping_counter = self.early_stopping
         self.scheduler = kwargs['scheduler']
         self.learning_rate = kwargs['learning_rate']
         self.min_learning_rate = kwargs['min_learning_rate']
-        self.patience = 5
+        self.patience = int(kwargs.get('patience', 5))
+        self.weight_decay = float(kwargs.get('weight_decay', 1e-5))
 
         self.criterion = kwargs['criterion']
         self.factor = kwargs['factor']
         self.verbose = kwargs['verbose']
         self.milestone = kwargs['milestone']
         self.load_best_at_each_epoch = kwargs['load_best_at_each_epoch']
+        self.best_score_mode = kwargs.get('best_score_mode', 'default')
 
         self.best_epoch_info = None
         self.optimizer, self.scheduler = None, None
@@ -66,8 +71,15 @@ class Trainer(object):
         self.save_plot = kwargs['save_plot']
         self.label_mean = float(kwargs.get('label_mean', 0.0))
         self.label_std = float(kwargs.get('label_std', 1.0))
-        self.risk_low = float(kwargs.get('risk_low', self.label_mean - 0.43 * self.label_std))
-        self.risk_high = float(kwargs.get('risk_high', self.label_mean + 0.43 * self.label_std))
+        self.huber_weight = float(kwargs.get('huber_weight', 0.70))
+        self.rank_weight = float(kwargs.get('rank_weight', 0.30))
+        self.rank_min_label_gap = float(kwargs.get('rank_min_label_gap', 0.4))
+        rank_min_label_gap_real = kwargs.get('rank_min_label_gap_real', None)
+        self.rank_min_label_gap_real = (
+            None if rank_min_label_gap_real is None else float(rank_min_label_gap_real)
+        )
+        self.loss_weighting = kwargs.get('loss_weighting', 'fixed')
+        self.lambda_attn = float(kwargs.get('lambda_attn', 0.0))
 
         # For checkpoint
         self.fit_finished = False
@@ -183,17 +195,30 @@ class Trainer(object):
             self.train_losses.append(train_loss)
             self.validate_losses.append(validate_loss)
 
-            validate_ccc = validate_record_dict['overall']['ccc']
-
             validate_overall = validate_record_dict['overall']
+            validate_ccc = validate_overall['ccc']
             validate_pcc = validate_overall['pcc'][0] if isinstance(validate_overall['pcc'], list) else validate_overall['pcc']
+            validate_mae = validate_overall.get('mae', validate_loss)
+            validate_rmse = validate_overall.get('rmse', validate_loss)
+            validate_r2 = validate_overall.get('r2', 0.0)
             validate_pred_std = validate_overall.get('pred_std', 0.0)
-            validate_score = (
-                validate_pcc
-                + 0.2 * validate_overall['ccc']
-                - 0.05 * validate_overall.get('mae', validate_loss)
-            )
-            if validate_pred_std < 1.0:
+
+            safe_pcc = validate_pcc if np.isfinite(validate_pcc) else 0.0
+            safe_ccc = validate_ccc if np.isfinite(validate_ccc) else 0.0
+            safe_rmse = validate_rmse if np.isfinite(validate_rmse) else validate_loss
+            safe_mae = validate_mae if np.isfinite(validate_mae) else validate_loss
+
+            if self.best_score_mode == 'corr_v2':
+                validate_score = safe_pcc + 0.5 * safe_ccc - 0.02 * safe_rmse
+            elif self.best_score_mode == 'val_mae':
+                validate_score = -safe_mae
+            else:
+                validate_score = (
+                    safe_pcc
+                    + 0.2 * safe_ccc
+                    - 0.05 * validate_mae
+                )
+            if self.best_score_mode != 'val_mae' and validate_pred_std < 1.0:
                 validate_score -= 1.0
 
             if validate_score > self.best_epoch_info['score']:
@@ -220,6 +245,54 @@ class Trainer(object):
                         int(self.best_epoch_info['epoch']) + 1,
                         improvement,
                         self.early_stopping_counter))
+                print(
+                    "BestScore mode={} | val_mae={:.4f}, val_rmse={:.4f}, val_r2={:.4f}, "
+                    "val_pcc={:.4f}, val_ccc={:.4f}, val_pred_std={:.4f}, validate_score={:.4f}".format(
+                        self.best_score_mode,
+                        validate_mae if np.isfinite(validate_mae) else 0.0,
+                        safe_rmse,
+                        validate_r2 if np.isfinite(validate_r2) else 0.0,
+                        safe_pcc,
+                        safe_ccc,
+                        validate_pred_std if np.isfinite(validate_pred_std) else 0.0,
+                        validate_score,
+                    )
+                )
+                if self.best_score_mode == 'val_mae':
+                    print("Checkpoint selection metric = validation MAE")
+                train_parts = train_record_dict['overall']
+                val_parts = validate_record_dict['overall']
+                for prefix, parts in (("train", train_parts), ("val  ", val_parts)):
+                    print(
+                        "LossParts {} | huber_loss={:.4f}, rank_loss={:.4f}, "
+                        "attn_reg={:.6f}, lambda_attn={:.6f}, base_loss={:.4f}, "
+                        "log_var_huber={:.4f}, log_var_rank={:.4f}, "
+                        "weight_huber={:.4f}, weight_rank={:.4f}, "
+                        "fusion_logit={:.4f}, fusion_alpha_direct={:.4f}, "
+                        "fusion_alpha_ordinal={:.4f}, total_loss={:.4f}, "
+                        "pred_std={:.4f}, label_std={:.4f}, rank_pairs={:.0f}".format(
+                            prefix,
+                            parts.get('huber_loss', 0.0),
+                            parts.get('rank_loss', 0.0),
+                            parts.get('attn_reg', 0.0),
+                            parts.get('lambda_attn', 0.0),
+                            parts.get('base_loss', 0.0),
+                            parts.get('log_var_huber', 0.0),
+                            parts.get('log_var_rank', 0.0),
+                            parts.get('weight_huber', 1.0),
+                            parts.get('weight_rank', 1.0),
+                            parts.get('fusion_logit', 0.0),
+                            parts.get('score_fusion_alpha', 0.7),
+                            parts.get('fusion_alpha_ordinal', 0.3),
+                            parts.get('total_loss', 0.0),
+                            parts.get('batch_pred_std', 0.0),
+                            parts.get('batch_label_std', 0.0),
+                            parts.get('valid_rank_pair_count', 0.0),
+                        )
+                    )
+                alpha_value = train_parts.get('score_fusion_alpha', 0.7)
+                if alpha_value < 0.2 or alpha_value > 0.9:
+                    print("Warning: fusion alpha is close to single-head dominance.")
 
                 print(train_record_dict['overall'])
                 print(validate_record_dict['overall'])
@@ -250,35 +323,44 @@ class Trainer(object):
         return train_loss, self.train_record_dict
 
     def loop(self, **kwargs):
-        """🌟 核心数据流动与 Loss 计算枢纽"""
-        dataloader_dict, epoch, train_mode = kwargs['dataloader_dict'], kwargs['epoch'], kwargs['train_mode']
+        """Run one train/validate/test pass for regression-only SI prediction."""
+        dataloader_dict = kwargs['dataloader_dict']
+        epoch = kwargs['epoch']
+        train_mode = kwargs['train_mode']
         dataloader = dataloader_dict['train'] if train_mode else (
-            dataloader_dict['test'] if epoch is None else dataloader_dict['validate'])
+            dataloader_dict['test'] if epoch is None else dataloader_dict['validate']
+        )
 
         running_loss = 0.0
         total_samples = 0
         all_preds, all_labels = [], []
-        all_risk_preds, all_risk_labels = [], []
+        loss_sums = {
+            'huber_loss': 0.0,
+            'rank_loss': 0.0,
+            'attn_reg': 0.0,
+            'lambda_attn': 0.0,
+            'base_loss': 0.0,
+            'total_loss': 0.0,
+            'batch_pred_std': 0.0,
+            'batch_label_std': 0.0,
+            'rank_margin': 0.0,
+            'valid_rank_pair_count': 0.0,
+        }
 
         for batch_idx, (X, Y, trial_ids) in tqdm(enumerate(dataloader), total=len(dataloader)):
-
             b_size = X.size(0)
-            if b_size == 0: continue
+            if b_size == 0:
+                continue
 
             inputs = X.to(self.device)
-
-            # 数据增强：训练模式下给输入特征加入高斯噪声
             if train_mode:
-                noise = torch.randn_like(inputs) * 0.05
-                inputs = inputs + noise
+                inputs = inputs + torch.randn_like(inputs) * 0.05
 
-            # 真实分数，形状 (Batch, 1)
             raw_labels = Y.to(self.device).float().view(b_size, 1)
 
             if train_mode:
                 self.optimizer.zero_grad()
             else:
-                # 终极杀毒：清洗 BatchNorm 的僵尸缓存
                 for m in self.model.modules():
                     if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
                         if m.running_var is not None:
@@ -287,87 +369,121 @@ class Trainer(object):
                             torch.nan_to_num_(m.running_mean, nan=0.0, posinf=0.0, neginf=0.0)
 
             model_output = self.model(inputs)
-            if len(model_output) == 3:
-                direct_score, ordinal_logits, risk_logits = model_output
+            if isinstance(model_output, (tuple, list)):
+                direct_score = model_output[0]
+                ordinal_logits = model_output[1] if len(model_output) > 1 else None
             else:
-                ordinal_logits, direct_score = model_output
-                risk_logits = None
-            ordinal_score_real = torch.sum(torch.sigmoid(ordinal_logits), dim=1, keepdim=True)
-            ordinal_score = (ordinal_score_real - self.label_mean) / (self.label_std + 1e-8)
-            expected_score = 0.7 * direct_score + 0.3 * ordinal_score
+                direct_score = model_output
+                ordinal_logits = None
+
+            expected_score = direct_score
+            if ordinal_logits is not None:
+                ordinal_score_real = torch.sum(torch.sigmoid(ordinal_logits), dim=1, keepdim=True)
+                ordinal_score = (ordinal_score_real - self.label_mean) / (self.label_std + 1e-8)
+                score_fusion_alpha = None
+                if hasattr(self.model, 'get_score_fusion_alpha'):
+                    score_fusion_alpha = self.model.get_score_fusion_alpha()
+                if score_fusion_alpha is None:
+                    expected_score = 0.7 * direct_score + 0.3 * ordinal_score
+                else:
+                    expected_score = score_fusion_alpha * direct_score + (1.0 - score_fusion_alpha) * ordinal_score
 
             huber_loss = F.smooth_l1_loss(expected_score, raw_labels)
-            rank_loss = pairwise_rank_loss(expected_score, raw_labels, margin=1.0, min_label_gap=0.4)
-            pred_std = torch.std(expected_score, unbiased=False)
-            label_std = torch.std(raw_labels, unbiased=False)
-            std_loss = torch.relu(0.6 * label_std - pred_std)
-            real_labels = raw_labels * self.label_std + self.label_mean
-            thresholds = torch.arange(
-                ordinal_logits.size(1),
-                device=self.device,
-                dtype=real_labels.dtype
-            ).view(1, -1)
-            ordinal_targets = (real_labels > thresholds).float()
-            cls_loss = torch.tensor(0.0, device=self.device)
-            sep_loss = torch.tensor(0.0, device=self.device)
-            if risk_logits is not None:
-                flat_real_labels = real_labels.view(-1)
-                valid_cls_mask = (flat_real_labels <= self.risk_low) | (flat_real_labels >= self.risk_high)
-                risk_labels = (flat_real_labels >= self.risk_high).long()
-                if valid_cls_mask.any():
-                    cls_loss = F.cross_entropy(risk_logits[valid_cls_mask], risk_labels[valid_cls_mask])
-                low_mask = flat_real_labels <= self.risk_low
-                high_mask = flat_real_labels >= self.risk_high
-                if low_mask.any() and high_mask.any():
-                    low_mean = torch.mean(expected_score.view(-1)[low_mask])
-                    high_mean = torch.mean(expected_score.view(-1)[high_mask])
-                    target_sep = 1.5 / (self.label_std + 1e-8)
-                    sep_loss = torch.relu(target_sep - (high_mean - low_mean))
-
-            loss = (
-                0.42 * huber_loss
-                + 0.25 * rank_loss
-                + 0.23 * cls_loss
-                + 0.05 * sep_loss
-                + 0.05 * std_loss
+            rank_gap = self.rank_min_label_gap
+            rank_margin_for_log = self.rank_min_label_gap
+            if self.rank_min_label_gap_real is not None:
+                rank_gap = self.rank_min_label_gap_real / (self.label_std + 1e-8)
+                rank_margin_for_log = self.rank_min_label_gap_real
+            rank_loss, valid_rank_pair_count = pairwise_rank_loss(
+                expected_score,
+                raw_labels,
+                margin=1.0,
+                min_label_gap=rank_gap,
+                return_count=True,
             )
 
-            # 保护大脑：如果损失爆炸，跳过该 batch
+            if (
+                self.loss_weighting == 'homoscedastic_uncertainty'
+                and hasattr(self.model, 'loss_weighting')
+                and self.model.loss_weighting is not None
+            ):
+                loss = self.model.loss_weighting(huber_loss, rank_loss)
+            else:
+                loss = self.huber_weight * huber_loss + self.rank_weight * rank_loss
+
+            base_loss = loss
+            attn_reg = torch.tensor(0.0, device=self.device)
+            if train_mode and self.lambda_attn > 0.0 and hasattr(self.model, 'attention_regularization'):
+                attn_reg = self.model.attention_regularization()
+                loss = loss + self.lambda_attn * attn_reg
+
             if torch.isnan(loss) or torch.isinf(loss) or torch.isnan(expected_score).any():
-                if train_mode: self.optimizer.zero_grad()
+                if train_mode:
+                    self.optimizer.zero_grad()
                 continue
 
             loss_val = loss.mean().item()
             running_loss += loss_val * b_size
             total_samples += b_size
 
+            pred_std = torch.std(expected_score, unbiased=False)
+            label_std = torch.std(raw_labels, unbiased=False)
+            loss_sums['huber_loss'] += huber_loss.detach().item() * b_size
+            loss_sums['rank_loss'] += rank_loss.detach().item() * b_size
+            loss_sums['attn_reg'] += attn_reg.detach().item() * b_size
+            loss_sums['lambda_attn'] += self.lambda_attn * b_size
+            loss_sums['base_loss'] += base_loss.detach().mean().item() * b_size
+            loss_sums['total_loss'] += loss.detach().mean().item() * b_size
+            loss_sums['batch_pred_std'] += pred_std.detach().item() * b_size
+            loss_sums['batch_label_std'] += label_std.detach().item() * b_size
+            loss_sums['rank_margin'] += rank_margin_for_log * b_size
+            loss_sums['valid_rank_pair_count'] += valid_rank_pair_count
+
+            if self.loss_weighting == 'homoscedastic_uncertainty' and hasattr(self.model, 'loss_weighting') and self.model.loss_weighting is not None:
+                weighting_values = self.model.loss_weighting.current_values()
+                for key in ('log_var_huber', 'log_var_rank', 'weight_huber', 'weight_rank'):
+                    loss_sums.setdefault(key, 0.0)
+                    loss_sums[key] += weighting_values[key] * b_size
+
+            if hasattr(self.model, 'get_score_fusion_alpha'):
+                alpha_value = self.model.get_score_fusion_alpha()
+                if alpha_value is not None:
+                    fusion_values = self.model.get_score_fusion_values() if hasattr(self.model, 'get_score_fusion_values') else None
+                    if fusion_values is None:
+                        fusion_values = {
+                            'fusion_logit': 0.0,
+                            'fusion_alpha_direct': float(alpha_value.detach().cpu().item()),
+                            'fusion_alpha_ordinal': float((1.0 - alpha_value).detach().cpu().item()),
+                        }
+                    loss_sums.setdefault('fusion_logit', 0.0)
+                    loss_sums.setdefault('score_fusion_alpha', 0.0)
+                    loss_sums.setdefault('fusion_alpha_ordinal', 0.0)
+                    loss_sums['fusion_logit'] += fusion_values['fusion_logit'] * b_size
+                    loss_sums['score_fusion_alpha'] += fusion_values['fusion_alpha_direct'] * b_size
+                    loss_sums['fusion_alpha_ordinal'] += fusion_values['fusion_alpha_ordinal'] * b_size
+
             if train_mode:
                 loss.backward()
-                # 刮骨疗毒，保留健康梯度
                 for p in self.model.parameters():
                     if p.grad is not None:
                         torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
-            # 记录真实尺度的预测值用于算 Metric
             for i in range(b_size):
                 pred_real = expected_score[i].detach().cpu().mean().item()
                 label_real = raw_labels[i].detach().cpu().mean().item()
-
                 if not np.isnan(pred_real) and not np.isnan(label_real):
                     all_preds.append(pred_real)
                     all_labels.append(label_real)
 
-            if risk_logits is not None:
-                valid_np = valid_cls_mask.detach().cpu().numpy()
-                risk_pred_np = torch.argmax(risk_logits, dim=1).detach().cpu().numpy()
-                risk_label_np = risk_labels.detach().cpu().numpy()
-                all_risk_preds.extend(risk_pred_np[valid_np].tolist())
-                all_risk_labels.extend(risk_label_np[valid_np].tolist())
-
         epoch_loss = running_loss / total_samples if total_samples > 0 else 0.0
+        loss_means = {}
+        for key, value in loss_sums.items():
+            if key == 'valid_rank_pair_count':
+                loss_means[key] = value
+            else:
+                loss_means[key] = value / total_samples if total_samples > 0 else 0.0
 
         all_preds = self.denormalize_labels(np.array(all_preds))
         all_labels = self.denormalize_labels(np.array(all_labels))
@@ -382,26 +498,6 @@ class Trainer(object):
         label_min_val = float(np.min(all_labels)) if len(all_labels) > 0 else 0.0
         label_max_val = float(np.max(all_labels)) if len(all_labels) > 0 else 0.0
         label_mean_val = float(np.mean(all_labels)) if len(all_labels) > 0 else 0.0
-        risk_acc_val = 0.0
-        risk_f1_val = 0.0
-        if len(all_risk_labels) > 0:
-            risk_preds_np = np.asarray(all_risk_preds)
-            risk_labels_np = np.asarray(all_risk_labels)
-            risk_acc_val = float(np.mean(risk_preds_np == risk_labels_np))
-            f1_values = []
-            for cls_idx in [0, 1]:
-                tp = np.sum((risk_preds_np == cls_idx) & (risk_labels_np == cls_idx))
-                fp = np.sum((risk_preds_np == cls_idx) & (risk_labels_np != cls_idx))
-                fn = np.sum((risk_preds_np != cls_idx) & (risk_labels_np == cls_idx))
-                precision = tp / (tp + fp + 1e-8)
-                recall = tp / (tp + fn + 1e-8)
-                f1_values.append(2 * precision * recall / (precision + recall + 1e-8))
-            risk_f1_val = float(np.mean(f1_values))
-
-        low_mask = all_labels <= self.risk_low
-        high_mask = all_labels >= self.risk_high
-        low_pred_mean = float(np.mean(all_preds[low_mask])) if np.any(low_mask) else 0.0
-        high_pred_mean = float(np.mean(all_preds[high_mask])) if np.any(high_mask) else 0.0
 
         if len(all_preds) > 0:
             mae_val = float(np.mean(np.abs(all_preds - all_labels)))
@@ -410,35 +506,37 @@ class Trainer(object):
                 try:
                     p, p_v = pearsonr(all_preds, all_labels)
                     pcc_val = [float(p), float(p_v)]
-
                     mean_p, mean_l = np.mean(all_preds), np.mean(all_labels)
                     var_p, var_l = np.var(all_preds), np.var(all_labels)
                     cov = np.mean((all_preds - mean_p) * (all_labels - mean_l))
                     ccc_val = float((2 * cov) / (var_p + var_l + (mean_p - mean_l) ** 2))
-                except:
+                except Exception:
                     pass
 
+        overall = {
+            'mae': mae_val,
+            'rmse': rmse_val,
+            'pcc': pcc_val,
+            'ccc': ccc_val,
+            'pred_std': pred_std_val,
+            'label_std': label_std_val,
+            'pred_min': pred_min_val,
+            'pred_max': pred_max_val,
+            'pred_mean': pred_mean_val,
+            'label_min': label_min_val,
+            'label_max': label_max_val,
+            'label_mean': label_mean_val,
+            **loss_means,
+        }
+
         epoch_result_dict = {
-            'mae': mae_val, 'rmse': rmse_val, 'pcc': pcc_val, 'ccc': ccc_val,
-            'pred_std': pred_std_val, 'label_std': label_std_val,
-            'overall': {
-                'mae': mae_val,
-                'rmse': rmse_val,
-                'pcc': pcc_val,
-                'ccc': ccc_val,
-                'pred_std': pred_std_val,
-                'label_std': label_std_val,
-                'pred_min': pred_min_val,
-                'pred_max': pred_max_val,
-                'pred_mean': pred_mean_val,
-                'label_min': label_min_val,
-                'label_max': label_max_val,
-                'label_mean': label_mean_val,
-                'risk_acc': risk_acc_val,
-                'risk_f1': risk_f1_val,
-                'low_pred_mean': low_pred_mean,
-                'high_pred_mean': high_pred_mean
-            }
+            'mae': mae_val,
+            'rmse': rmse_val,
+            'pcc': pcc_val,
+            'ccc': ccc_val,
+            'pred_std': pred_std_val,
+            'label_std': label_std_val,
+            'overall': overall,
         }
 
         return epoch_loss, epoch_result_dict
@@ -454,7 +552,11 @@ class Trainer(object):
         return params_to_update
 
     def init_optimizer_and_scheduler(self, epoch=0):
-        self.optimizer = optim.AdamW(self.get_parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        self.optimizer = optim.AdamW(
+            self.get_parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
 
         reduce_on_plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', patience=self.patience, factor=self.factor)

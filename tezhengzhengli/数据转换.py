@@ -35,7 +35,7 @@ def batch_convert_and_replace(root_path):
 
 
 # 设置你的文件夹路径
-target_directory = r'C:\Users\云瑾\Desktop\data\Data_NO_SI\compacted_EEG1'
+target_directory = r'C:\Users\云瑾\Desktop\data\Data_Processed\compacted_EEG'
 
 # 执行批量处理
 batch_convert_and_replace(target_directory)

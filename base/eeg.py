@@ -14,6 +14,7 @@ class GenericEegController(object):
         self.buffer_sec = config['buffer_sec']
         self.frequency = config['sampling_frequency']
         self.window_sec = config['window_sec']
+        self.pli_feature_mode = config.get('pli_feature_mode', 'delta_pli')
         self.step = int(config['hop_sec'] * self.frequency)
         self.interest_bands = config['interest_bands']
         self.f_trans_interest_bands = config['f_trans_interest_bands']
@@ -130,7 +131,18 @@ class GenericEegController(object):
     # ==========================================
     #  4. PLI 提取 140维路线B (含 4 段基线法)
     # ==========================================
+    def _print_pli_stats(self, name, values):
+        values = np.asarray(values, dtype=np.float32)
+        print(
+            f"{name} shape={values.shape}, "
+            f"mean/std/min/max={np.mean(values):.6f}/"
+            f"{np.std(values):.6f}/{np.min(values):.6f}/{np.max(values):.6f}"
+        )
+
     def calculate_PLI(self, data):
+        pli_window_sec = float(self.window_sec)
+        print("PLI feature mode = delta_pli")
+        print("Output feature = Task_PLI - Base_PLI")
         data_filtered = filter_band(data=data.T, bands=self.interest_bands, fs=self.frequency,
                                     order=self.filter_order)
         num_bands = data_filtered.shape[0]
@@ -142,20 +154,33 @@ class GenericEegController(object):
             global_phases.append(band_phase)
         global_phases = np.stack(global_phases, axis=0)
 
-        #
+        baseline_region_start = 5.0
+        baseline_region_end = 25.0
+        baseline_hop_sec = 5.0
+        baseline_starts = np.arange(
+            baseline_region_start,
+            baseline_region_end - pli_window_sec + 1e-6,
+            baseline_hop_sec,
+        )
+        baseline_windows = [(float(s), float(s + pli_window_sec)) for s in baseline_starts]
+
         base_features = []
-        for i in range(4):
-            b_start = int((5 + i * 5) * self.frequency)
-            b_end = int((5 + (i + 1) * 5) * self.frequency)
+        for b_start_sec, b_end_sec in baseline_windows:
+            b_start = int(b_start_sec * self.frequency)
+            b_end = int(b_end_sec * self.frequency)
             b_pli_bands = []
             for b in range(num_bands):
                 b_pli_bands.append(PhaseLagIndex_Edges(global_phases[b, :, b_start:b_end]))
             base_features.append(np.concatenate(b_pli_bands))
+        base_features = np.asarray(base_features, dtype=np.float32)
+        print(f"base_features shape={base_features.shape}")
         base_pli = np.mean(base_features, axis=0)
+        self._print_pli_stats("base_pli", base_pli)
 
-        PLIs = []
+        task_plis = []
+        delta_plis = []
         time_len = data_filtered.shape[2]
-        samples_per_stimulus = int(self.window_sec * self.frequency)
+        samples_per_stimulus = int(pli_window_sec * self.frequency)
         for idx in self.stimulus_indices:
             start = idx
             end = start + samples_per_stimulus
@@ -166,8 +191,18 @@ class GenericEegController(object):
                     seg_phase = np.pad(seg_phase, ((0, 0), (0, end - time_len)), mode='edge')
                 task_pli_list.append(PhaseLagIndex_Edges(seg_phase))
             task_pli = np.concatenate(task_pli_list)
-            PLIs.append(task_pli - base_pli)
-        return np.stack(PLIs), base_pli
+            delta_pli = task_pli - base_pli
+            task_plis.append(task_pli)
+            delta_plis.append(delta_pli)
+
+        task_pli_seq = np.stack(task_plis).astype(np.float32)      # [40, 140]
+        delta_pli_seq = np.stack(delta_plis).astype(np.float32)    # [40, 140]
+        task_pli_seq_t = task_pli_seq.T                            # [140, 40]
+        delta_pli_seq_t = delta_pli_seq.T                          # [140, 40]
+
+        self._print_pli_stats("task_pli_seq", task_pli_seq_t)
+        self._print_pli_stats("delta_pli_seq", delta_pli_seq_t)
+        return None, delta_pli_seq, None, base_pli.astype(np.float32)
 
     # ==========================================
     # 预处理主流程 (防泄露标准化)
@@ -228,8 +263,11 @@ class GenericEegController(object):
             task_fe, base_fe = self.calculate_FE(norm_data_transposed)
             extracted_data.update({'eeg_FE': task_fe, 'eeg_FE_base': base_fe})
         if "eeg_PLI" in self.eeg_feature_list:
-            task_pli, base_pli = self.calculate_PLI(norm_data_transposed)
-            extracted_data.update({'eeg_PLI': task_pli, 'eeg_PLI_base': base_pli})
+            task_pli, delta_pli, pli_2ch, base_pli = self.calculate_PLI(norm_data_transposed)
+            extracted_data.update({
+                'eeg_PLI': delta_pli,
+                'eeg_PLI_base': base_pli,
+            })
 
         return extracted_data
 

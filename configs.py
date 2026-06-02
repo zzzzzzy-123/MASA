@@ -1,67 +1,128 @@
 config = {
     "extract_class_label": 1,
-    "extract_continuous_label": 0,  # 你是整段脑电对应一个打分，所以连续标签设为0
-
+    "extract_continuous_label": 0,
     "extract_eeg": 1,
     "eeg_folder": "eeg",
     "eeg_config": {
-        "sampling_frequency": 250,  # 你数据真实的采样率
-        "window_sec": 5,  # 5秒提取一次特征
-        "hop_sec": 5,  # 每5秒滑窗一次
+        "sampling_frequency": 250,
+        "window_sec": 5,
+        "hop_sec": 5,
         "buffer_sec": 5,
-        "num_electrodes": 8,  # 你的真实通道数：8
+        "num_electrodes": 8,
         "interest_bands": [(4, 8), (8, 10), (10, 13), (13, 20), (20, 30)],
-        "channel_slice": {'eeg': slice(0, 8)},
-        'features': ['eeg_DE', 'eeg_RP', 'eeg_FE', 'eeg_PLI',
-             'eeg_DE_base', 'eeg_RP_base', 'eeg_FE_base', 'eeg_PLI_base'],
-        "filter_type": 'butter',
+        "channel_slice": {"eeg": slice(0, 8)},
+        "features": ["eeg_PLI"],
+        "filter_type": "butter",
         "filter_order": 4,
         "f_trans_interest_bands": [[4, 8], [8, 10], [10, 13], [13, 20], [20, 30]],
         "sfreq": 250,
+        "pli_feature_mode": "delta_pli",
     },
-
     "save_npy": 1,
     "npy_folder": "compacted_EEG",
-
     "dataset_name": "Risk_EEG",
-    # 填入包含 "minor_scale_2_gai.xlsx - Sheet1.csv" 标签表的那个上级文件夹路径
     "root_directory": r"C:\Users\云瑾\Desktop\data",
-
-    # 填入截图里这个装着所有 SIEEG 文件夹的名字
-    "raw_data_folder": "SIEEG_no_SI",
-
-    # 标签文件的准确名字（确保它放在 root_directory 下）
+    "raw_data_folder": "SIEEG",
     "label_file": "minor_scale_2_gai.xlsx",
-
-    # 预处理后保存的位置
-    "output_root_directory": r"C:\Users\云瑾\Desktop\data\Data_NO_SI",
-
-    "emotion_list": ["SI", "SAS", "SDS"],  # 替换掉了 Valence/Arousal
-
+    "output_root_directory": r"C:\Users\云瑾\Desktop\data\Data_Processed",
+    "emotion_list": ["SI", "SAS", "SDS"],
     "multiplier": {
         "eeg_raw": 1,
         "eeg_DE": 1,
         "continuous_label": 1,
     },
-
     "feature_dimension": {
-    "eeg_raw": (2000,),
-    "eeg_DE": (40,),  # 8通道 * 5频段
-    "eeg_RP": (40,),  # 8通道 * 5频段
-    "eeg_FE": (40,),   # 8通道 * 5频段 = 40维
-    "eeg_PLI": (140,),  # 28条边 * 5频段 = 140维
-    "eeg_DE_base": (40,),
-    "eeg_RP_base": (40,),
-    "eeg_FE_base": (40,),
-    "eeg_PLI_base": (140,),
-    "class_label": (1,),
-},
-
+        "eeg_raw": (2000,),
+        "eeg_DE": (40,),
+        "eeg_RP": (40,),
+        "eeg_FE": (40,),
+        "eeg_PLI": (140,),
+        "class_label": (1,),
+    },
     "max_epoch": 50,
     "min_epoch": 0,
     "early_stopping": 20,
     "load_best_at_each_epoch": 1,
     "time_delay": 0,
-    "metrics": ["rmse", "pcc", "ccc"],
+    "metrics": ["mae", "rmse", "r2", "pcc", "ccc"],
     "save_plot": 1,
+    "experiments": {
+        "Exp_DeltaPLI_PLIEncoder_GRU_RegOnly_LearnableLoss": {
+            "features": ["eeg_PLI"],
+            "num_chan": 28,
+            "thickness": 5,
+            "huber_weight": 0.70,
+            "rank_weight": 0.30,
+            "gru_gate": 0.05,
+            "learning_rate": 2e-4,
+            "cnn1d_dropout": 0.35,
+            "weight_decay": 1e-4,
+            "patience": 4,
+            "early_stopping": 8,
+            "loss_weighting": "homoscedastic_uncertainty",
+        },
+        "Exp_DeltaPLI_PLIEncoder_RegOnly_LearnableLoss_NoGRU": {
+            "features": ["eeg_PLI"],
+            "num_chan": 28,
+            "thickness": 5,
+            "huber_weight": 0.70,
+            "rank_weight": 0.30,
+            "gru_gate": 0.05,
+            "learning_rate": 2e-4,
+            "cnn1d_dropout": 0.35,
+            "weight_decay": 1e-4,
+            "patience": 4,
+            "early_stopping": 8,
+            "loss_weighting": "homoscedastic_uncertainty",
+            "use_gru": False,
+        },
+        "Exp_DeltaPLI_PLIEncoder_TemporalBandEdgeAttnLite_GRU_RegOnly_LearnableLoss_lr1e4_wd5e4": {
+            "features": ["eeg_PLI"],
+            "num_chan": 28,
+            "thickness": 5,
+            "huber_weight": 0.70,
+            "rank_weight": 0.30,
+            "gru_gate": 0.05,
+            "learning_rate": 1e-4,
+            "cnn1d_dropout": 0.35,
+            "weight_decay": 5e-4,
+            "patience": 3,
+            "early_stopping": 5,
+            "loss_weighting": "homoscedastic_uncertainty",
+            "use_gru": True,
+            "use_temporal_band_edge_attention": True,
+            "gamma_band": 0.05,
+            "gamma_edge": 0.05,
+            "band_mlp_hidden_dim": 8,
+            "edge_mlp_hidden_dim": 32,
+            "attention_dropout": 0.2,
+            "lambda_attn": 1e-3,
+            "best_score_mode": "val_mae",
+        },
+        "Exp_DeltaPLI_PLIEncoder_TemporalBandEdgeAttnLite_GRU_RegOnly_LearnableLoss_lr1e4_wd5e4_LearnableFusion": {
+            "features": ["eeg_PLI"],
+            "num_chan": 28,
+            "thickness": 5,
+            "huber_weight": 0.70,
+            "rank_weight": 0.30,
+            "gru_gate": 0.05,
+            "learning_rate": 1e-4,
+            "cnn1d_dropout": 0.35,
+            "weight_decay": 5e-4,
+            "patience": 3,
+            "early_stopping": 5,
+            "loss_weighting": "homoscedastic_uncertainty",
+            "use_gru": True,
+            "use_temporal_band_edge_attention": True,
+            "gamma_band": 0.05,
+            "gamma_edge": 0.05,
+            "band_mlp_hidden_dim": 8,
+            "edge_mlp_hidden_dim": 32,
+            "attention_dropout": 0.2,
+            "lambda_attn": 1e-3,
+            "best_score_mode": "val_mae",
+            "learnable_score_fusion": True,
+            "init_score_fusion_alpha": 0.7,
+        },
+    },
 }

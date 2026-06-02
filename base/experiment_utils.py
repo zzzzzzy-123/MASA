@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import logging
+import random
 from datetime import datetime
 
 import numpy as np
@@ -10,9 +11,25 @@ import torch
 from torch.utils.data import DataLoader
 from scipy.stats import pearsonr
 
-from base.dataset import EEG_Fusion_Dataset, compute_label_scaler, compute_train_scaler
+from base.dataset import (
+    EEG_Fusion_Dataset,
+    compute_label_scaler,
+    compute_train_scaler,
+)
 from base.trainer import Trainer
 from model.model_utils import get_model
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def build_dataloader_generator(seed, fold, split_offset=0):
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + int(fold) * 100 + int(split_offset))
+    return generator
 
 
 def setup_logger(save_path, exp_name):
@@ -155,15 +172,22 @@ def collect_predictions(model, dataloader, device, label_scaler=None):
             output = model(X)
 
             if isinstance(output, tuple):
-                if len(output) == 3:
-                    direct_score, ordinal_logits, _ = output
-                else:
-                    ordinal_logits, direct_score = output
+                direct_score = output[0]
+                ordinal_logits = output[1] if len(output) > 1 else None
                 expected_score = direct_score
-                if label_scaler is not None:
+                if label_scaler is not None and ordinal_logits is not None:
                     ordinal_score_real = torch.sum(torch.sigmoid(ordinal_logits), dim=1, keepdim=True)
                     ordinal_score = (ordinal_score_real - label_scaler['mean']) / (label_scaler['std'] + 1e-8)
-                    expected_score = 0.7 * direct_score + 0.3 * ordinal_score
+                    score_fusion_alpha = None
+                    if hasattr(model, 'get_score_fusion_alpha'):
+                        score_fusion_alpha = model.get_score_fusion_alpha()
+                    if score_fusion_alpha is None:
+                        expected_score = 0.7 * direct_score + 0.3 * ordinal_score
+                    else:
+                        expected_score = (
+                            score_fusion_alpha * direct_score
+                            + (1.0 - score_fusion_alpha) * ordinal_score
+                        )
             else:
                 expected_score = output
 
@@ -181,29 +205,43 @@ def collect_predictions(model, dataloader, device, label_scaler=None):
     return np.array(all_preds), np.array(all_labels), all_trial_ids
 
 
-def fit_validation_calibrator(preds, labels):
-    preds = np.asarray(preds, dtype=np.float32).reshape(-1)
-    labels = np.asarray(labels, dtype=np.float32).reshape(-1)
+def collect_channel_attention_weights(model, dataloader, device):
+    if not hasattr(model, 'latest_channel_weights'):
+        return None
 
-    pred_std = float(np.std(preds))
-    label_std = float(np.std(labels))
-    if len(preds) < 3 or pred_std < 0.05 or label_std < 1e-6:
-        return 1.0, 0.0, False
+    model.eval()
+    weights = []
+    with torch.no_grad():
+        for X, _, _ in dataloader:
+            X = X.to(device)
+            _ = model(X)
+            latest = getattr(model, 'latest_channel_weights', None)
+            if latest is not None:
+                weights.append(latest.detach().cpu().numpy())
 
-    pcc_value = compute_regression_metrics(preds, labels)['pcc']
-    if pcc_value <= 0.05:
-        return 1.0, 0.0, False
+    if len(weights) == 0:
+        return None
 
-    cov = float(np.mean((preds - np.mean(preds)) * (labels - np.mean(labels))))
-    slope = cov / (float(np.var(preds)) + 1e-8)
-    slope = float(np.clip(slope, 0.0, 20.0))
-    intercept = float(np.mean(labels) - slope * np.mean(preds))
-
-    return slope, intercept, True
+    return np.concatenate(weights, axis=0)
 
 
-def apply_calibrator(preds, slope, intercept):
-    return np.asarray(preds).reshape(-1) * slope + intercept
+def collect_gru_token_mixer_diagnostics(model, dataloader, device):
+    if not hasattr(model, 'latest_gru_shapes'):
+        return None
+
+    model.eval()
+    with torch.no_grad():
+        for X, _, _ in dataloader:
+            X = X.to(device)
+            _ = model(X)
+            shapes = getattr(model, 'latest_gru_shapes', None)
+            gate = {
+                'gru_gate': getattr(model, 'latest_gru_gate', None),
+                'cls_gate': getattr(model, 'latest_cls_gate', None),
+            }
+            if shapes is not None:
+                return shapes, gate
+    return None
 
 
 def print_prediction_distribution(name, preds, labels):
@@ -271,41 +309,140 @@ def run_single_fold(
     thickness,
     args,
     save_root,
-    device
+    device,
 ):
-    print_split_info(fold_data)
+    input_mode = getattr(args, 'input_mode', 'delta_pli')
+    print(f"input_mode = {input_mode}")
+    sample_folder = fold_data['train'][0][0]
+    feature_path = os.path.join(sample_folder, 'eeg_PLI.npy')
+    print("feature_source = Delta-PLI")
+    print("Delta-PLI feature loaded = True")
+    print(f"feature file path = {feature_path}")
+    print("feature cache name = eeg_PLI.npy")
+    if os.path.exists(feature_path):
+        sample_feature = np.load(feature_path).astype(np.float32)
+        print(
+            "delta_pli mean/std/min/max = "
+            f"{np.mean(sample_feature):.6f}/{np.std(sample_feature):.6f}/"
+            f"{np.min(sample_feature):.6f}/{np.max(sample_feature):.6f}"
+        )
 
-    train_scaler = compute_train_scaler(fold_data['train'], features)
+    train_scaler = compute_train_scaler(fold_data['train'], features, input_mode=input_mode)
     label_scaler = compute_label_scaler(fold_data['train'])
     print(
         f"SI label scaler(train only): mean={label_scaler['mean']:.4f}, "
         f"std={label_scaler['std']:.4f}"
     )
+    print("mode = regression_only")
+    print("Regression-only training = True")
+    print("Auxiliary classification heads = removed")
+    print("Feature scaler fit split = train only")
+    print("Label scaler fit split = train only")
+    print("Threshold fit split = disabled")
+    seed = int(getattr(args, 'seed', 2026))
+    print(f"DataLoader worker seed base = {seed}")
 
     dataloaders = {
         'train': DataLoader(
-            EEG_Fusion_Dataset(fold_data['train'], features, scaler=train_scaler, label_scaler=label_scaler),
+            EEG_Fusion_Dataset(
+                fold_data['train'],
+                features,
+                scaler=train_scaler,
+                label_scaler=label_scaler,
+                input_mode=input_mode,
+            ),
             batch_size=args.batch_size,
-            shuffle=True
+            shuffle=True,
+            worker_init_fn=seed_worker,
+            generator=build_dataloader_generator(seed, fold, 1),
         ),
         'validate': DataLoader(
-            EEG_Fusion_Dataset(fold_data['validate'], features, scaler=train_scaler, label_scaler=label_scaler),
+            EEG_Fusion_Dataset(
+                fold_data['validate'],
+                features,
+                scaler=train_scaler,
+                label_scaler=label_scaler,
+                input_mode=input_mode,
+            ),
             batch_size=args.batch_size,
-            shuffle=False
+            shuffle=False,
+            worker_init_fn=seed_worker,
+            generator=build_dataloader_generator(seed, fold, 2),
         ),
         'test': DataLoader(
-            EEG_Fusion_Dataset(fold_data['test'], features, scaler=train_scaler, label_scaler=label_scaler),
+            EEG_Fusion_Dataset(
+                fold_data['test'],
+                features,
+                scaler=train_scaler,
+                label_scaler=label_scaler,
+                input_mode=input_mode,
+            ),
             batch_size=args.batch_size,
-            shuffle=False
-        )
+            shuffle=False,
+            worker_init_fn=seed_worker,
+            generator=build_dataloader_generator(seed, fold, 3),
+        ),
     }
+
+    if features == ['eeg_PLI']:
+        try:
+            x_pli, _, _ = next(iter(dataloaders['train']))
+            print(f"x_pli shape = {list(x_pli.shape)}")
+            if x_pli.dim() != 4 or x_pli.shape[1] != 1 or x_pli.shape[2] != 140 or x_pli.shape[3] != 40:
+                print(f"WARNING: expected x_pli shape [B, 1, 140, 40], got {list(x_pli.shape)}")
+        except Exception as shape_err:
+            print(f"WARNING: failed to inspect x_pli shape: {shape_err}")
 
     model = get_model(
         features=features,
         num_chan=num_chan,
         thickness=thickness,
-        dropout=args.cnn1d_dropout
+        dropout=args.cnn1d_dropout,
+        model_type=getattr(args, 'model_type', 'masa_tcn'),
+        experiment_name=exp_name,
+        channel_attention=getattr(args, 'channel_attention', True),
+        gru_gate=getattr(args, 'gru_gate', 0.05),
+        gru_num_layers=getattr(args, 'gru_num_layers', 1),
+        gru_bidirectional=getattr(args, 'gru_bidirectional', False),
+        use_gru=getattr(args, 'use_gru', True),
+        use_band_edge_attention=getattr(args, 'use_band_edge_attention', False),
+        use_temporal_band_edge_attention=getattr(args, 'use_temporal_band_edge_attention', False),
+        attn_scale=getattr(args, 'attn_scale', 0.1),
+        gamma_band=getattr(args, 'gamma_band', 0.2),
+        gamma_edge=getattr(args, 'gamma_edge', 0.2),
+        band_mlp_hidden_dim=getattr(args, 'band_mlp_hidden_dim', 16),
+        edge_mlp_hidden_dim=getattr(args, 'edge_mlp_hidden_dim', 64),
+        attention_dropout=getattr(args, 'attention_dropout', 0.0),
+        learnable_score_fusion=getattr(args, 'learnable_score_fusion', False),
+        init_score_fusion_alpha=getattr(args, 'init_score_fusion_alpha', 0.7),
+        loss_weighting=getattr(args, 'loss_weighting', 'fixed'),
+        input_channels=1,
     ).to(device)
+
+    if getattr(args, 'learnable_score_fusion', False) and hasattr(model, 'score_fusion_logit'):
+        included_in_parameters = any(param is model.score_fusion_logit for param in model.parameters())
+        print(f"fusion_logit requires_grad = {model.score_fusion_logit.requires_grad}")
+        print(f"fusion_logit included in optimizer = {included_in_parameters}")
+
+    print("MASA-TCN in_channels = 1")
+    print("PLI-oriented encoder enabled = True")
+    if getattr(args, 'use_temporal_band_edge_attention', False):
+        print("Backbone = PLIEncoderTemporalBandEdgeAttention")
+        print(f"gamma_band = {getattr(args, 'gamma_band', 0.2)}")
+        print(f"gamma_edge = {getattr(args, 'gamma_edge', 0.2)}")
+        print(f"BandMLP hidden_dim = {getattr(args, 'band_mlp_hidden_dim', 16)}")
+        print(f"EdgeMLP hidden_dim = {getattr(args, 'edge_mlp_hidden_dim', 64)}")
+        print(f"Attention dropout = {getattr(args, 'attention_dropout', 0.0)}")
+        if getattr(args, 'lambda_attn', 0.0) > 0:
+            print("Attention regularization enabled = True")
+            print(f"lambda_attn = {getattr(args, 'lambda_attn', 0.0)}")
+    elif getattr(args, 'use_band_edge_attention', False):
+        print("Backbone = PLIEncoderBandEdgeAttention")
+        print(f"attn_scale = {getattr(args, 'attn_scale', 0.1)}")
+    else:
+        print("Backbone = PLIEncoder")
+    print("MASA-TCN enabled = False")
+    print(f"GRU Token Mixer enabled = {getattr(args, 'use_gru', True)}")
 
     args_dict = vars(args).copy()
     args_dict.update({
@@ -324,10 +461,26 @@ def run_single_fold(
         'fold': fold,
         'label_mean': label_scaler['mean'],
         'label_std': label_scaler['std'],
-        'risk_low': label_scaler['risk_low'],
-        'risk_high': label_scaler['risk_high'],
+        'huber_weight': getattr(args, 'huber_weight', 0.70),
+        'rank_weight': getattr(args, 'rank_weight', 0.30),
+        'rank_min_label_gap': getattr(args, 'rank_min_label_gap', 0.4),
+        'rank_min_label_gap_real': getattr(args, 'rank_min_label_gap_real', None),
+        'loss_weighting': getattr(args, 'loss_weighting', 'fixed'),
+        'use_gru': getattr(args, 'use_gru', True),
+        'use_band_edge_attention': getattr(args, 'use_band_edge_attention', False),
+        'use_temporal_band_edge_attention': getattr(args, 'use_temporal_band_edge_attention', False),
+        'attn_scale': getattr(args, 'attn_scale', 0.1),
+        'gamma_band': getattr(args, 'gamma_band', 0.2),
+        'gamma_edge': getattr(args, 'gamma_edge', 0.2),
+        'band_mlp_hidden_dim': getattr(args, 'band_mlp_hidden_dim', 16),
+        'edge_mlp_hidden_dim': getattr(args, 'edge_mlp_hidden_dim', 64),
+        'attention_dropout': getattr(args, 'attention_dropout', 0.0),
+        'lambda_attn': getattr(args, 'lambda_attn', 0.0),
+        'learnable_score_fusion': getattr(args, 'learnable_score_fusion', False),
+        'init_score_fusion_alpha': getattr(args, 'init_score_fusion_alpha', 0.7),
+        'best_score_mode': getattr(args, 'best_score_mode', 'default'),
         'min_epoch': 5,
-        'max_epoch': 50
+        'max_epoch': 50,
     })
 
     exp_logger = ExperimentLogger(args_dict['save_path'], args_dict)
@@ -336,38 +489,21 @@ def run_single_fold(
     train_loss, train_record = trainer.fit(
         dataloader_dict=dataloaders,
         checkpoint_controller=exp_logger,
-        parameter_controller=exp_logger
+        parameter_controller=exp_logger,
     )
 
-    print(f"第 {fold + 1} 折训练结束，模型权重保存至: {args_dict['save_path']}")
+    print(f"? {fold + 1} ?????????????: {args_dict['save_path']}")
 
     test_loss, test_record_dict = trainer.test(
         checkpoint_controller=exp_logger,
         dataloader_dict=dataloaders,
-        epoch=None
+        epoch=None,
     )
 
     baseline_value, baseline_metrics = compute_mean_baseline_metrics(fold_data)
-    val_preds, val_labels, _ = collect_predictions(
-        trainer.model, dataloaders['validate'], device, label_scaler=label_scaler
-    )
-    calib_slope, calib_intercept, calib_enabled = fit_validation_calibrator(val_preds, val_labels)
-    apply_calibration_outputs = False
-    print(
-        f"Validation calibrator: fitted={calib_enabled}, applied={apply_calibration_outputs}, "
-        f"slope={calib_slope:.4f}, intercept={calib_intercept:.4f}"
-    )
 
     train_preds, train_labels, train_trial_ids = collect_predictions(
         trainer.model, dataloaders['train'], device, label_scaler=label_scaler
-    )
-    save_prediction_table(
-        args_dict['save_path'],
-        train_trial_ids,
-        train_labels,
-        apply_calibrator(train_preds, calib_slope, calib_intercept) if apply_calibration_outputs else train_preds,
-        baseline_value,
-        'calibrated_train_predictions.csv'
     )
     train_prediction_csv = save_prediction_table(
         args_dict['save_path'],
@@ -375,43 +511,62 @@ def run_single_fold(
         train_labels,
         train_preds,
         baseline_value,
-        'train_predictions.csv'
+        'train_predictions.csv',
     )
 
     preds, labels, trial_ids = collect_predictions(
         trainer.model, dataloaders['test'], device, label_scaler=label_scaler
     )
     print_prediction_distribution("Test", preds, labels)
+
+    gru_diag = collect_gru_token_mixer_diagnostics(trainer.model, dataloaders['test'], device)
+    if gru_diag is not None:
+        gru_shapes, gates = gru_diag
+        print("GRU Token Mixer RegOnly enabled")
+        print(f"x_pli shape: {gru_shapes.get('x_pli')}")
+        if gru_shapes.get('pli_oriented_encoder'):
+            print("PLI-oriented encoder enabled = True")
+            if gru_shapes.get('temporal_band_edge_attention'):
+                print("Backbone = PLIEncoderTemporalBandEdgeAttention")
+                print(f"band_gate shape: {gru_shapes.get('band_gate')}")
+                print(f"edge_gate shape: {gru_shapes.get('edge_gate')}")
+            elif gru_shapes.get('band_edge_attention'):
+                print("Backbone = PLIEncoderBandEdgeAttention")
+            else:
+                print("Backbone = PLIEncoder")
+        print(f"h_seq shape: {gru_shapes.get('h_seq')}")
+        print(f"h_base shape: {gru_shapes.get('h_base')}")
+        if gru_shapes.get('gru_enabled') is False:
+            print("h_fused = h_base")
+        else:
+            print(f"h_gru shape: {gru_shapes.get('h_gru')}")
+            print(f"h_gru_proj shape: {gru_shapes.get('h_gru_proj')}")
+        print(f"h_fused shape: {gru_shapes.get('h_fused')}")
+        print(f"direct_score shape: {gru_shapes.get('direct_score')}")
+        print(f"ordinal_logits shape: {gru_shapes.get('ordinal_logits')}")
+        print(f"expected_score shape: {gru_shapes.get('expected_score')}")
+        if gru_shapes.get('learnable_score_fusion'):
+            print("Score fusion: expected_score = alpha * direct_score + (1-alpha) * ordinal_score")
+            print(f"fusion_logit = {gru_shapes.get('fusion_logit'):.4f}")
+            print(f"fusion_alpha_direct = {gru_shapes.get('score_fusion_alpha'):.4f}")
+            print(f"fusion_alpha_ordinal = {gru_shapes.get('fusion_alpha_ordinal'):.4f}")
+        gru_gate = gates.get('gru_gate') if isinstance(gates, dict) else gates
+        if gru_gate is not None and gru_shapes.get('gru_enabled') is not False:
+            print(f"gru_gate = {gru_gate:.4f}")
+
     metrics = compute_regression_metrics(preds, labels)
-    risk_acc = test_record_dict['overall'].get('risk_acc', 0.0)
-    risk_f1 = test_record_dict['overall'].get('risk_f1', 0.0)
-    low_pred_mean = test_record_dict['overall'].get('low_pred_mean', 0.0)
-    high_pred_mean = test_record_dict['overall'].get('high_pred_mean', 0.0)
-    print(
-        f"Risk Head -> acc: {risk_acc:.4f}, f1: {risk_f1:.4f}, "
-        f"low_pred_mean: {low_pred_mean:.4f}, high_pred_mean: {high_pred_mean:.4f}, "
-        f"sep: {high_pred_mean - low_pred_mean:.4f}"
-    )
     save_prediction_table(
-        args_dict['save_path'],
-        trial_ids,
-        labels,
-        apply_calibrator(preds, calib_slope, calib_intercept) if apply_calibration_outputs else preds,
-        baseline_value,
-        'calibrated_test_predictions.csv'
-    )
-    prediction_csv = save_prediction_table(
         args_dict['save_path'],
         trial_ids,
         labels,
         preds,
         baseline_value,
-        'test_predictions.csv'
+        'test_predictions.csv',
     )
-    print(f"第 {fold + 1} 折训练集逐样本预测已保存: {train_prediction_csv}")
-
+    prediction_csv = os.path.join(args_dict['save_path'], 'test_predictions.csv')
+    print(f"? {fold + 1} ????????????: {train_prediction_csv}")
     print(
-        f"第 {fold + 1} 折 Test -> "
+        f"? {fold + 1} ? Test -> "
         f"MAE: {metrics['mae']:.4f}, "
         f"RMSE: {metrics['rmse']:.4f}, "
         f"R2: {metrics['r2']:.4f}, "
@@ -419,40 +574,48 @@ def run_single_fold(
         f"CCC: {metrics['ccc']:.4f}"
     )
     print(
-        f"第 {fold + 1} 折 Mean Baseline(train mean={baseline_value:.4f}) -> "
+        f"? {fold + 1} ? Mean Baseline(train mean={baseline_value:.4f}) -> "
         f"MAE: {baseline_metrics['mae']:.4f}, "
         f"RMSE: {baseline_metrics['rmse']:.4f}, "
         f"R2: {baseline_metrics['r2']:.4f}, "
         f"PCC: {baseline_metrics['pcc']:.4f}, "
         f"CCC: {baseline_metrics['ccc']:.4f}"
     )
-    print(f"第 {fold + 1} 折测试集逐样本预测已保存: {prediction_csv}")
+    print(f"? {fold + 1} ????????????: {prediction_csv}")
 
     metrics_with_baseline = metrics.copy()
-    metrics_with_baseline['risk_acc'] = risk_acc
-    metrics_with_baseline['risk_f1'] = risk_f1
-    metrics_with_baseline['low_pred_mean'] = low_pred_mean
-    metrics_with_baseline['high_pred_mean'] = high_pred_mean
+    for key in ('log_var_huber', 'log_var_rank', 'weight_huber', 'weight_rank'):
+        if key in test_record_dict['overall']:
+            metrics_with_baseline[key] = test_record_dict['overall'][key]
+    metrics_with_baseline['input_mode'] = input_mode
+    metrics_with_baseline['feature_type'] = 'Delta-PLI'
+    metrics_with_baseline['input_channels'] = 1
+    metrics_with_baseline['baseline_correction'] = 'task_minus_baseline'
     for key, value in baseline_metrics.items():
         metrics_with_baseline[f'baseline_{key}'] = value
 
-    exp_logger.save_log_to_csv(
-        epoch='test_final',
-        test_record=metrics_with_baseline
-    )
+    exp_logger.save_log_to_csv(epoch='test_final', test_record=metrics_with_baseline)
 
     try:
-        from base.utils import plot_training_curves
+        import matplotlib.pyplot as plt
+        plot_dir = os.path.join(args_dict['save_path'], 'plots')
+        os.makedirs(plot_dir, exist_ok=True)
+        plt.figure(figsize=(8, 4))
+        plt.plot(trainer.train_losses, label='Train Loss')
+        plt.plot(trainer.validate_losses, label='Validation Loss')
+        plt.title(f'{exp_name} Fold {fold + 1} Training Curve')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.tight_layout()
+        plot_path = os.path.join(plot_dir, f'training_curves_fold_{fold}.png')
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"?????????: {plot_path}")
+    except Exception as plot_err:
+        print(f"?????????: {plot_err}")
 
-        curve_save_dir = os.path.join(args_dict['save_path'], 'plots')
-        os.makedirs(curve_save_dir, exist_ok=True)
-        plot_training_curves(train_record, curve_save_dir, fold)
-        print(f"第 {fold + 1} 折训练曲线已生成。")
-    except Exception as e:
-        print(f"训练曲线生成失败，已跳过: {e}")
-
-    return metrics
-
+    return metrics_with_baseline
 
 def summarize_fold_metrics(exp_name, fold_metrics):
     print(f"\n【{exp_name}】5折交叉验证最终战报")
