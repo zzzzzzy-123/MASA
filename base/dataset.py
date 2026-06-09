@@ -9,6 +9,7 @@ import hashlib
 
 
 PLI_DELTA_MODE = "delta_pli"
+MULTI_PLI_MODES = {"delta_task", "delta_rest", "delta_task_rest"}
 
 
 def load_delta_pli_cache(folder_path):
@@ -18,11 +19,52 @@ def load_delta_pli_cache(folder_path):
     return feature_path
 
 
+def load_rest_pli_cache(folder_path):
+    feature_path = os.path.join(folder_path, "eeg_PLI_base.npy")
+    if not os.path.exists(feature_path):
+        raise ValueError(
+            "Rest-PLI feature not found. Multi-PLI experiments require "
+            f"eeg_PLI_base.npy in each sample folder: {feature_path}"
+        )
+    return feature_path
+
+
 def load_feature_array(folder_path, feat_name, input_mode=PLI_DELTA_MODE):
     if feat_name == 'eeg_PLI':
         feature_path = load_delta_pli_cache(folder_path)
         return np.load(feature_path).astype(np.float32)
     return np.load(os.path.join(folder_path, f"{feat_name}.npy")).astype(np.float32)
+
+
+def pli_delta_to_matrix(delta_data):
+    return feature_to_matrix("eeg_PLI", delta_data)
+
+
+def pli_rest_to_matrix(rest_data):
+    rest_data = np.asarray(rest_data, dtype=np.float32)
+    if rest_data.ndim == 1 and rest_data.shape[0] == 140:
+        return np.repeat(rest_data[:, None], 40, axis=1).astype(np.float32)
+    if rest_data.ndim == 2:
+        if rest_data.shape == (40, 140):
+            return feature_to_matrix("eeg_PLI", rest_data)
+        if rest_data.shape == (140, 40):
+            return rest_data.astype(np.float32)
+    raise ValueError(f"Unsupported Rest-PLI shape {rest_data.shape}; expected [140], [40,140], or [140,40].")
+
+
+def load_multi_pli_matrix(folder_path, input_mode):
+    delta_path = load_delta_pli_cache(folder_path)
+    rest_path = load_rest_pli_cache(folder_path)
+    delta_matrix = pli_delta_to_matrix(np.load(delta_path).astype(np.float32))
+    rest_matrix = pli_rest_to_matrix(np.load(rest_path).astype(np.float32))
+    task_matrix = delta_matrix + rest_matrix
+
+    branches = [delta_matrix]
+    if input_mode in ("delta_task", "delta_task_rest"):
+        branches.append(task_matrix)
+    if input_mode in ("delta_rest", "delta_task_rest"):
+        branches.append(rest_matrix)
+    return np.stack(branches, axis=0).astype(np.float32)
 
 
 def feature_to_matrix(feat_name, data):
@@ -54,15 +96,18 @@ class EEG_Fusion_Dataset(Dataset):
         folder_path, si_score, trial_id = self.data_list[index]
         fused_features = []
 
-        for feat_name in self.feature_combo:
-            data = load_feature_array(folder_path, feat_name, input_mode=self.input_mode)
-
-            fused_features.append(feature_to_matrix(feat_name, data))
-
-        if len(fused_features) == 1 and fused_features[0].ndim == 3:
-            final_matrix = fused_features[0]  # [2, 140, 40]
+        if self.feature_combo == ['eeg_PLI'] and self.input_mode in MULTI_PLI_MODES:
+            final_matrix = load_multi_pli_matrix(folder_path, self.input_mode)
         else:
-            final_matrix = np.concatenate(fused_features, axis=0)  # (sum feature dims, 40)
+            for feat_name in self.feature_combo:
+                data = load_feature_array(folder_path, feat_name, input_mode=self.input_mode)
+
+                fused_features.append(feature_to_matrix(feat_name, data))
+
+            if len(fused_features) == 1 and fused_features[0].ndim == 3:
+                final_matrix = fused_features[0]  # [branches, 140, 40]
+            else:
+                final_matrix = np.concatenate(fused_features, axis=0)  # (sum feature dims, 40)
 
         # 在此处进行特征级别的 Z-score！
         if self.scaler is not None:
@@ -90,14 +135,17 @@ def compute_train_scaler(train_list, feature_combo, input_mode=PLI_DELTA_MODE):
     for item in train_list:
         folder_path = item[0]
         fused_features = []
-        for feat_name in feature_combo:
-            data = load_feature_array(folder_path, feat_name, input_mode=input_mode)
-            fused_features.append(feature_to_matrix(feat_name, data))
-
-        if len(fused_features) == 1 and fused_features[0].ndim == 3:
-            final_matrix = fused_features[0]
+        if feature_combo == ['eeg_PLI'] and input_mode in MULTI_PLI_MODES:
+            final_matrix = load_multi_pli_matrix(folder_path, input_mode)
         else:
-            final_matrix = np.concatenate(fused_features, axis=0)
+            for feat_name in feature_combo:
+                data = load_feature_array(folder_path, feat_name, input_mode=input_mode)
+                fused_features.append(feature_to_matrix(feat_name, data))
+
+            if len(fused_features) == 1 and fused_features[0].ndim == 3:
+                final_matrix = fused_features[0]
+            else:
+                final_matrix = np.concatenate(fused_features, axis=0)
         all_matrices.append(final_matrix)
 
     # 把训练集所有病人的数据拼成一个巨大的张量
@@ -114,8 +162,11 @@ def compute_train_scaler(train_list, feature_combo, input_mode=PLI_DELTA_MODE):
     feature_dims = {}
     offset = 0
     for feat_name in feature_combo:
-        sample_data = load_feature_array(train_list[0][0], feat_name, input_mode=input_mode)
-        dim = feature_to_matrix(feat_name, sample_data).shape[0]
+        if feature_combo == ['eeg_PLI'] and input_mode in MULTI_PLI_MODES:
+            dim = load_multi_pli_matrix(train_list[0][0], input_mode).shape[0]
+        else:
+            sample_data = load_feature_array(train_list[0][0], feat_name, input_mode=input_mode)
+            dim = feature_to_matrix(feat_name, sample_data).shape[0]
         feature_dims[feat_name] = {
             'start': offset,
             'end': offset + dim,
@@ -292,13 +343,14 @@ class DataArranger(object):
         self.fixed_split_path = split_path
 
         print(f"Using fixed fold split = {self.fixed_split_path}")
+        print(f"Fold split seed = {self.seed}")
         if os.path.exists(self.fixed_split_path):
             with open(self.fixed_split_path, "r", encoding="utf-8") as f:
                 split_data = json.load(f)
             self.fixed_split_loaded = True
-            print(f"Loaded existing fixed split from {self.fixed_split_path}")
+            print(f"Loaded fixed split from {self.fixed_split_path}")
         else:
-            print(f"Fixed split file not found. Creating new split with seed = {self.seed}")
+            print(f"Fixed split file not found. Creating fixed 5-fold split with fold_split_seed = {self.seed}")
             split_data = self._create_fixed_splits()
             os.makedirs(os.path.dirname(self.fixed_split_path), exist_ok=True)
             with open(self.fixed_split_path, "w", encoding="utf-8") as f:
@@ -316,6 +368,9 @@ class DataArranger(object):
             raise ValueError("Fixed split sample_count does not match current dataset.")
 
         print(f"Subject-wise split enabled = {bool(split_data.get('subject_wise_split', True))}")
+        if split_data.get("selection_method"):
+            print(f"Split selection method = {split_data.get('selection_method')}")
+            print("No test performance was used for split selection.")
         print(f"Reproducibility check: fixed split loaded = {self.fixed_split_loaded}")
         print("Reproducibility check: fold ids identical across runs = True")
         return split_data
@@ -333,6 +388,20 @@ class DataArranger(object):
             and train_set.isdisjoint(test_set)
             and val_set.isdisjoint(test_set)
         )
+
+        def label_stats(ids):
+            labels = np.asarray([float(self.trial_by_id[item_id][1]) for item_id in ids], dtype=np.float32)
+            return (
+                float(np.mean(labels)),
+                float(np.std(labels)),
+                float(np.min(labels)),
+                float(np.max(labels)),
+            )
+
+        train_stats = label_stats(train_ids)
+        val_stats = label_stats(val_ids)
+        test_stats = label_stats(test_ids)
+
         print(f"Fold {fold_idx + 1}:")
         print(f"train size = {len(train_ids)}")
         print(f"val size = {len(val_ids)}")
@@ -340,6 +409,18 @@ class DataArranger(object):
         print(f"train ids hash = {self._hash_ids(train_ids)}")
         print(f"val ids hash = {self._hash_ids(val_ids)}")
         print(f"test ids hash = {self._hash_ids(test_ids)}")
+        print(
+            "train label mean/std/min/max = "
+            f"{train_stats[0]:.4f}/{train_stats[1]:.4f}/{train_stats[2]:.4f}/{train_stats[3]:.4f}"
+        )
+        print(
+            "val label mean/std/min/max = "
+            f"{val_stats[0]:.4f}/{val_stats[1]:.4f}/{val_stats[2]:.4f}/{val_stats[3]:.4f}"
+        )
+        print(
+            "test label mean/std/min/max = "
+            f"{test_stats[0]:.4f}/{test_stats[1]:.4f}/{test_stats[2]:.4f}/{test_stats[3]:.4f}"
+        )
         print(f"No subject overlap between train/val/test = {no_overlap}")
         if not no_overlap:
             raise ValueError("Fixed fold split has overlapping train/val/test ids.")

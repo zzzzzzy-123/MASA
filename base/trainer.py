@@ -80,6 +80,10 @@ class Trainer(object):
         )
         self.loss_weighting = kwargs.get('loss_weighting', 'fixed')
         self.lambda_attn = float(kwargs.get('lambda_attn', 0.0))
+        self.lambda_fusion_prior = float(kwargs.get('lambda_fusion_prior', 0.0))
+        self.use_std_ratio_loss = bool(kwargs.get('use_std_ratio_loss', False))
+        self.target_std_ratio = float(kwargs.get('target_std_ratio', 0.25))
+        self.lambda_std = float(kwargs.get('lambda_std', 0.0))
 
         # For checkpoint
         self.fit_finished = False
@@ -149,6 +153,15 @@ class Trainer(object):
                 'train_pcc': [], 'val_pcc': [],
                 'lr': []
             }
+        record_metric_keys = [
+            'mae', 'ccc', 'rmse', 'pcc', 'pred_std', 'label_std',
+            'std_loss', 'target_std_ratio', 'lambda_std', 'weighted_std_loss',
+            'pred_std_ratio',
+            'huber_loss', 'rank_loss', 'base_loss', 'total_loss',
+        ]
+        for metric_key in record_metric_keys:
+            self.train_record_dict.setdefault(f'train_{metric_key}', [])
+            self.train_record_dict.setdefault(f'val_{metric_key}', [])
 
         train_loss = 0.0
 
@@ -183,10 +196,12 @@ class Trainer(object):
             self.train_record_dict['val_loss'].append(validate_loss)
             self.train_record_dict['lr'].append(self.optimizer.param_groups[0]['lr'])
 
-            for k in ['mae', 'ccc', 'rmse', 'pcc']:
+            for k in record_metric_keys:
                 if k in train_record_dict['overall']:
+                    self.train_record_dict.setdefault(f'train_{k}', [])
                     self.train_record_dict[f'train_{k}'].append(train_record_dict['overall'][k])
                 if k in validate_record_dict['overall']:
+                    self.train_record_dict.setdefault(f'val_{k}', [])
                     self.train_record_dict[f'val_{k}'].append(validate_record_dict['overall'][k])
 
             if validate_loss < 0:
@@ -265,17 +280,26 @@ class Trainer(object):
                 for prefix, parts in (("train", train_parts), ("val  ", val_parts)):
                     print(
                         "LossParts {} | huber_loss={:.4f}, rank_loss={:.4f}, "
-                        "attn_reg={:.6f}, lambda_attn={:.6f}, base_loss={:.4f}, "
+                        "std_loss={:.6f}, target_std_ratio={:.4f}, lambda_std={:.6f}, "
+                        "lambda_std * std_loss={:.6f}, attn_reg={:.6f}, lambda_attn={:.6f}, "
+                        "lambda_attn * attn_reg={:.6f}, base_loss={:.4f}, "
                         "log_var_huber={:.4f}, log_var_rank={:.4f}, "
                         "weight_huber={:.4f}, weight_rank={:.4f}, "
                         "fusion_logit={:.4f}, fusion_alpha_direct={:.4f}, "
                         "fusion_alpha_ordinal={:.4f}, total_loss={:.4f}, "
-                        "pred_std={:.4f}, label_std={:.4f}, rank_pairs={:.0f}".format(
+                        "pred_std={:.4f}, label_std={:.4f}, pred_std_ratio={:.4f}, rank_pairs={:.0f}, "
+                        "temporal_alpha_mean={:.6f}, temporal_alpha_std={:.6f}, "
+                        "temporal_alpha_min={:.6f}, temporal_alpha_max={:.6f}".format(
                             prefix,
                             parts.get('huber_loss', 0.0),
                             parts.get('rank_loss', 0.0),
+                            parts.get('std_loss', 0.0),
+                            parts.get('target_std_ratio', self.target_std_ratio),
+                            parts.get('lambda_std', 0.0),
+                            parts.get('weighted_std_loss', 0.0),
                             parts.get('attn_reg', 0.0),
                             parts.get('lambda_attn', 0.0),
+                            parts.get('weighted_attn_reg', 0.0),
                             parts.get('base_loss', 0.0),
                             parts.get('log_var_huber', 0.0),
                             parts.get('log_var_rank', 0.0),
@@ -287,9 +311,58 @@ class Trainer(object):
                             parts.get('total_loss', 0.0),
                             parts.get('batch_pred_std', 0.0),
                             parts.get('batch_label_std', 0.0),
+                            parts.get('batch_pred_std', 0.0) / (parts.get('batch_label_std', 0.0) + 1e-8),
                             parts.get('valid_rank_pair_count', 0.0),
+                            parts.get('temporal_alpha_mean', 0.0),
+                            parts.get('temporal_alpha_std', 0.0),
+                            parts.get('temporal_alpha_min', 0.0),
+                            parts.get('temporal_alpha_max', 0.0),
                         )
                     )
+                    if 'fusion_w_delta' in parts or 'fusion_w_task' in parts:
+                        print(
+                            "Multi-PLI learnable_softmax {} | w_delta={:.6f}, w_task={:.6f}, "
+                            "fusion_prior_loss={:.6f}, lambda_fusion_prior={:.6f}, "
+                            "lambda_fusion_prior * fusion_prior_loss={:.6f}".format(
+                                prefix,
+                                parts.get('fusion_w_delta', float('nan')),
+                                parts.get('fusion_w_task', float('nan')),
+                                parts.get('fusion_prior_loss', float('nan')),
+                                parts.get('lambda_fusion_prior', float('nan')),
+                                parts.get('weighted_fusion_prior_loss', float('nan')),
+                            )
+                        )
+                    if any(key in parts for key in ('gate_task', 'gate_rest', 'effective_task_scale', 'effective_rest_scale')):
+                        print(
+                            "Multi-PLI gated_residual {} | gate_task={:.6f}, gate_rest={:.6f}, "
+                            "effective_task_scale={:.6f}, effective_rest_scale={:.6f}".format(
+                                prefix,
+                                parts.get('gate_task', float('nan')),
+                                parts.get('gate_rest', float('nan')),
+                                parts.get('effective_task_scale', float('nan')),
+                                parts.get('effective_rest_scale', float('nan')),
+                            )
+                        )
+                    if any(f"scale_weight_d{d}" in parts for d in (1, 2, 4)):
+                        print(
+                            "ParallelTCN {} | scale_weight_d1={:.6f}, scale_weight_d2={:.6f}, scale_weight_d4={:.6f}".format(
+                                prefix,
+                                parts.get('scale_weight_d1', 0.0),
+                                parts.get('scale_weight_d2', 0.0),
+                                parts.get('scale_weight_d4', 0.0),
+                            )
+                        )
+                        for dilation in (1, 2, 4):
+                            print(
+                                "ParallelTCN {} | branch_alpha_d{} mean/std/min/max={:.6f}/{:.6f}/{:.6f}/{:.6f}".format(
+                                    prefix,
+                                    dilation,
+                                    parts.get(f'branch_alpha_d{dilation}_mean', 0.0),
+                                    parts.get(f'branch_alpha_d{dilation}_std', 0.0),
+                                    parts.get(f'branch_alpha_d{dilation}_min', 0.0),
+                                    parts.get(f'branch_alpha_d{dilation}_max', 0.0),
+                                )
+                            )
                 alpha_value = train_parts.get('score_fusion_alpha', 0.7)
                 if alpha_value < 0.2 or alpha_value > 0.9:
                     print("Warning: fusion alpha is close to single-head dominance.")
@@ -339,12 +412,21 @@ class Trainer(object):
             'rank_loss': 0.0,
             'attn_reg': 0.0,
             'lambda_attn': 0.0,
+            'weighted_attn_reg': 0.0,
+            'std_loss': 0.0,
+            'target_std_ratio': 0.0,
+            'lambda_std': 0.0,
+            'weighted_std_loss': 0.0,
             'base_loss': 0.0,
             'total_loss': 0.0,
             'batch_pred_std': 0.0,
             'batch_label_std': 0.0,
             'rank_margin': 0.0,
             'valid_rank_pair_count': 0.0,
+            'temporal_alpha_mean': 0.0,
+            'temporal_alpha_std': 0.0,
+            'temporal_alpha_min': 0.0,
+            'temporal_alpha_max': 0.0,
         }
 
         for batch_idx, (X, Y, trial_ids) in tqdm(enumerate(dataloader), total=len(dataloader)):
@@ -411,11 +493,27 @@ class Trainer(object):
             else:
                 loss = self.huber_weight * huber_loss + self.rank_weight * rank_loss
 
+            pred_std = torch.std(expected_score, unbiased=False)
+            label_std = torch.std(raw_labels, unbiased=False)
+            std_ratio = pred_std / (label_std + 1e-6)
+            std_loss = (std_ratio - self.target_std_ratio) ** 2
+
             base_loss = loss
             attn_reg = torch.tensor(0.0, device=self.device)
             if train_mode and self.lambda_attn > 0.0 and hasattr(self.model, 'attention_regularization'):
                 attn_reg = self.model.attention_regularization()
                 loss = loss + self.lambda_attn * attn_reg
+            fusion_prior_loss = torch.tensor(0.0, device=self.device)
+            fusion_prior_enabled = (
+                self.lambda_fusion_prior > 0.0
+                and hasattr(self.model, 'fusion_prior_regularization')
+                and getattr(self.model, 'multi_pli_fusion_type', None) == 'learnable_softmax'
+            )
+            if fusion_prior_enabled:
+                fusion_prior_loss = self.model.fusion_prior_regularization()
+                loss = loss + self.lambda_fusion_prior * fusion_prior_loss
+            if train_mode and self.use_std_ratio_loss and self.lambda_std > 0.0:
+                loss = loss + self.lambda_std * std_loss
 
             if torch.isnan(loss) or torch.isinf(loss) or torch.isnan(expected_score).any():
                 if train_mode:
@@ -426,12 +524,15 @@ class Trainer(object):
             running_loss += loss_val * b_size
             total_samples += b_size
 
-            pred_std = torch.std(expected_score, unbiased=False)
-            label_std = torch.std(raw_labels, unbiased=False)
             loss_sums['huber_loss'] += huber_loss.detach().item() * b_size
             loss_sums['rank_loss'] += rank_loss.detach().item() * b_size
             loss_sums['attn_reg'] += attn_reg.detach().item() * b_size
             loss_sums['lambda_attn'] += self.lambda_attn * b_size
+            loss_sums['weighted_attn_reg'] += (self.lambda_attn * attn_reg.detach().item()) * b_size
+            loss_sums['std_loss'] += std_loss.detach().item() * b_size
+            loss_sums['target_std_ratio'] += self.target_std_ratio * b_size
+            loss_sums['lambda_std'] += self.lambda_std * b_size
+            loss_sums['weighted_std_loss'] += (self.lambda_std * std_loss.detach().item()) * b_size
             loss_sums['base_loss'] += base_loss.detach().mean().item() * b_size
             loss_sums['total_loss'] += loss.detach().mean().item() * b_size
             loss_sums['batch_pred_std'] += pred_std.detach().item() * b_size
@@ -461,6 +562,42 @@ class Trainer(object):
                     loss_sums['fusion_logit'] += fusion_values['fusion_logit'] * b_size
                     loss_sums['score_fusion_alpha'] += fusion_values['fusion_alpha_direct'] * b_size
                     loss_sums['fusion_alpha_ordinal'] += fusion_values['fusion_alpha_ordinal'] * b_size
+
+            if hasattr(self.model, 'get_temporal_alpha_stats'):
+                temporal_stats = self.model.get_temporal_alpha_stats()
+                if temporal_stats is not None:
+                    for key in ('temporal_alpha_mean', 'temporal_alpha_std', 'temporal_alpha_min', 'temporal_alpha_max'):
+                        loss_sums.setdefault(key, 0.0)
+                        loss_sums[key] += temporal_stats[key] * b_size
+
+            if hasattr(self.model, 'get_parallel_tcn_stats'):
+                parallel_stats = self.model.get_parallel_tcn_stats()
+                if parallel_stats is not None:
+                    for key, value in parallel_stats.items():
+                        loss_sums.setdefault(key, 0.0)
+                        loss_sums[key] += float(value) * b_size
+
+            if hasattr(self.model, 'get_multi_pli_gate_values'):
+                multi_gate_values = self.model.get_multi_pli_gate_values()
+                if multi_gate_values is not None:
+                    fusion_type = getattr(self.model, 'multi_pli_fusion_type', 'gated_residual')
+                    if fusion_type == 'learnable_softmax':
+                        allowed_keys = {'fusion_w_delta', 'fusion_w_task', 'fusion_prior_loss'}
+                    elif fusion_type == 'gated_residual':
+                        allowed_keys = {'gate_task', 'gate_rest', 'effective_task_scale', 'effective_rest_scale'}
+                    else:
+                        allowed_keys = set()
+                    for key, value in multi_gate_values.items():
+                        if key not in allowed_keys:
+                            continue
+                        loss_sums.setdefault(key, 0.0)
+                        loss_sums[key] += float(value) * b_size
+                    if fusion_type == 'learnable_softmax':
+                        prior_value = float(multi_gate_values.get('fusion_prior_loss', 0.0))
+                        loss_sums.setdefault('lambda_fusion_prior', 0.0)
+                        loss_sums.setdefault('weighted_fusion_prior_loss', 0.0)
+                        loss_sums['lambda_fusion_prior'] += self.lambda_fusion_prior * b_size
+                        loss_sums['weighted_fusion_prior_loss'] += (self.lambda_fusion_prior * prior_value) * b_size
 
             if train_mode:
                 loss.backward()
@@ -520,6 +657,7 @@ class Trainer(object):
             'ccc': ccc_val,
             'pred_std': pred_std_val,
             'label_std': label_std_val,
+            'pred_std_ratio': float(pred_std_val / (label_std_val + 1e-8)),
             'pred_min': pred_min_val,
             'pred_max': pred_max_val,
             'pred_mean': pred_mean_val,
